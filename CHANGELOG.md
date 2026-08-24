@@ -11,6 +11,10 @@ interfaces and stored data formats may still change.
 
 - A single “DomLingo: AI translate current page” context-menu action that reuses the existing translation flow and opens Settings when configuration is missing.
 
+### Changed
+
+- Completed semantic blocks now write back immediately instead of waiting for earlier concurrent batches, while split paragraphs, list items, and table rows remain atomic.
+
 ## [0.1.0-alpha.0] - 2026-08-08
 
 ### Added

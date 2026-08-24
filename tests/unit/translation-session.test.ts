@@ -282,14 +282,11 @@ describe('PageTranslationSession', () => {
     expect(session.getStatus().failureDetails.MISSING_ID).toBeUndefined();
   });
 
-  it('buffers concurrent responses and writes batches in page order', async () => {
+  it('writes completed semantic blocks without waiting for an earlier slow batch', async () => {
     document.body.innerHTML = `<main>${Array.from(
       { length: 30 },
       (_value, index) => `<p>Ordered paragraph ${index + 1} contains translatable English.</p>`,
     ).join('')}</main>`;
-    const originalText = document.querySelector('main')!.textContent;
-    const statusSnapshots: number[] = [];
-    const translatedParagraphSnapshots: number[][] = [];
     const messages: TranslateBatchMessage[] = [];
     let resolveFirst: ((response: unknown) => void) | undefined;
     const firstResponse = new Promise((resolve) => {
@@ -313,30 +310,69 @@ describe('PageTranslationSession', () => {
     });
     vi.stubGlobal('chrome', { runtime: { sendMessage } });
 
-    const session = new PageTranslationSession(document, (status) => {
-      if (status.state === 'translating') {
-        statusSnapshots.push(status.translated);
-        translatedParagraphSnapshots.push(
-          [...document.querySelectorAll('p')].flatMap((paragraph, index) =>
-            paragraph.textContent?.startsWith('译文:') ? [index] : [],
-          ),
-        );
-      }
-    });
+    const session = new PageTranslationSession(document);
     session.start({ batchCharacterLimit: 2_000, concurrency: 3 });
     await vi.waitFor(() => expect(messages.length).toBeGreaterThan(1));
-    await Promise.resolve();
+    await vi.waitFor(() =>
+      expect(
+        [...document.querySelectorAll('p')].some((paragraph) =>
+          paragraph.textContent?.startsWith('译文:'),
+        ),
+      ).toBe(true),
+    );
 
-    expect(document.querySelector('main')?.textContent).toBe(originalText);
+    expect(document.querySelector('p')?.textContent).toContain('Ordered paragraph 1');
+    expect(session.getStatus().translated).toBeGreaterThan(0);
+    expect(session.getStatus().translated).toBeLessThan(30);
     resolveFirst?.(responseFor(messages[0]!));
     await vi.waitFor(() => expect(session.getStatus().state).toBe('completed'));
 
-    const committed = statusSnapshots.filter((count) => count > 0);
-    expect(committed).toEqual([...committed].sort((left, right) => left - right));
-    for (const snapshot of translatedParagraphSnapshots) {
-      expect(snapshot).toEqual(Array.from({ length: snapshot.length }, (_value, index) => index));
-    }
     expect(session.getStatus().translated).toBe(30);
+  });
+
+  it('keeps a semantic block atomic while unrelated completed blocks write immediately', async () => {
+    const longParagraph = `${'A'.repeat(900)}. ${'B'.repeat(900)}. ${'C'.repeat(900)}.`;
+    document.body.innerHTML = `
+      <main>
+        <p id="long">${longParagraph}</p>
+        <p id="independent">An independent paragraph can be displayed as soon as it is ready.</p>
+      </main>
+    `;
+    const messages: TranslateBatchMessage[] = [];
+    let resolveFirst: ((response: unknown) => void) | undefined;
+    const firstResponse = new Promise((resolve) => {
+      resolveFirst = resolve;
+    });
+    const responseFor = (message: TranslateBatchMessage) => ({
+      ok: true,
+      result: {
+        translations: message.payload.blocks.flatMap((block) =>
+          block.segments.map((segment) => ({ id: segment.id, text: `译文:${segment.text}` })),
+        ),
+        failedIds: [],
+        failures: [],
+      },
+    });
+    const sendMessage = vi.fn((message: { type?: string }) => {
+      if (message.type !== 'TRANSLATE_BATCH') return Promise.resolve({ ok: true });
+      const batch = message as TranslateBatchMessage;
+      messages.push(batch);
+      return messages.length === 1 ? firstResponse : Promise.resolve(responseFor(batch));
+    });
+    vi.stubGlobal('chrome', { runtime: { sendMessage } });
+
+    const session = new PageTranslationSession(document);
+    session.start({ batchCharacterLimit: 2_000, concurrency: 3 });
+
+    await vi.waitFor(() => expect(messages.length).toBeGreaterThanOrEqual(3));
+    await vi.waitFor(() =>
+      expect(document.querySelector('#independent')?.textContent).toContain('译文:'),
+    );
+    expect(document.querySelector('#long')?.textContent).toBe(longParagraph);
+
+    resolveFirst?.(responseFor(messages[0]!));
+    await vi.waitFor(() => expect(session.getStatus().state).toBe('completed'));
+    expect(document.querySelector('#long')?.textContent).toContain('译文:');
   });
 
   it('retries only records that are still untranslated', async () => {
