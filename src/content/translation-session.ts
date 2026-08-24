@@ -315,60 +315,48 @@ export class PageTranslationSession {
     const processedSegmentIds = new Set<string>();
     const segmentFailures = new Map<string, PageTranslationFailureCode>();
     const staleRecordIds = new Set<string>();
-    const readyBatches = new Map<
-      number,
-      { blocks: TranslationBlock[]; response: TranslateBatchResponse }
-    >();
-    let nextBatchToCommit = 0;
 
-    const commitReadyBatches = (): void => {
+    const commitBatch = (blocks: TranslationBlock[], response: TranslateBatchResponse): void => {
       if (!this.root) return;
-      for (;;) {
-        const ready = readyBatches.get(nextBatchToCommit);
-        if (!ready) return;
-        readyBatches.delete(nextBatchToCommit);
-
-        for (const block of ready.blocks) {
-          for (const segment of block.segments) processedSegmentIds.add(segment.id);
-        }
-
-        if (!ready.response.ok) {
-          lastError = ready.response.message ?? '模型服务没有返回有效结果。';
-          for (const block of ready.blocks) {
-            for (const segment of block.segments) {
-              segmentFailures.set(segment.id, ready.response.code);
-            }
-          }
-        } else {
-          for (const translation of ready.response.result.translations) {
-            this.translations.set(translation.id, translation.text);
-          }
-          for (const failure of ready.response.result.failures) {
-            segmentFailures.set(failure.id, failure.reason);
-          }
-          const mutation = applyTranslations(this.root, this.records, this.translations);
-          for (const recordId of mutation.staleRecordIds) staleRecordIds.add(recordId);
-        }
-
-        const failureDetails = buildFailureDetails(
-          this.records,
-          this.translations,
-          processedSegmentIds,
-          segmentFailures,
-          staleRecordIds,
-          false,
-        );
-        this.status.translated = this.records.filter(
-          (record) => record.appliedValue !== undefined,
-        ).length;
-        this.status.failed = failureCount(failureDetails);
-        this.status.failureDetails = failureDetails;
-        this.setStatus({
-          ...this.status,
-          message: `正在翻译 ${this.status.translated + this.status.failed} / ${this.status.total}…`,
-        });
-        nextBatchToCommit += 1;
+      for (const block of blocks) {
+        for (const segment of block.segments) processedSegmentIds.add(segment.id);
       }
+
+      if (!response.ok) {
+        lastError = response.message ?? '模型服务没有返回有效结果。';
+        for (const block of blocks) {
+          for (const segment of block.segments) {
+            segmentFailures.set(segment.id, response.code);
+          }
+        }
+      } else {
+        for (const translation of response.result.translations) {
+          this.translations.set(translation.id, translation.text);
+        }
+        for (const failure of response.result.failures) {
+          segmentFailures.set(failure.id, failure.reason);
+        }
+        const mutation = applyTranslations(this.root, this.records, this.translations);
+        for (const recordId of mutation.staleRecordIds) staleRecordIds.add(recordId);
+      }
+
+      const failureDetails = buildFailureDetails(
+        this.records,
+        this.translations,
+        processedSegmentIds,
+        segmentFailures,
+        staleRecordIds,
+        false,
+      );
+      this.status.translated = this.records.filter(
+        (record) => record.appliedValue !== undefined,
+      ).length;
+      this.status.failed = failureCount(failureDetails);
+      this.status.failureDetails = failureDetails;
+      this.setStatus({
+        ...this.status,
+        message: `正在翻译 ${this.status.translated + this.status.failed} / ${this.status.total}…`,
+      });
     };
 
     await mapWithConcurrency(batches, options.concurrency, async (blocks, batchIndex) => {
@@ -397,12 +385,10 @@ export class PageTranslationSession {
       }
 
       if (generation !== this.generation || !this.root) return;
-      readyBatches.set(batchIndex, { blocks, response });
-      commitReadyBatches();
+      commitBatch(blocks, response);
     });
 
     if (generation !== this.generation) return;
-    commitReadyBatches();
     const finalFailureDetails = buildFailureDetails(
       this.records,
       this.translations,
